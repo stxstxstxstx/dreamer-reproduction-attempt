@@ -61,7 +61,6 @@ class DeepMindControl:
       raise ValueError("Only render mode 'rgb_array' is supported.")
     return self._env.physics.render(*self._size, camera_id=self._camera)
 
-
 class Atari:
 
   LOCK = threading.Lock()
@@ -146,55 +145,159 @@ class Atari:
     image = image[:, :, None] if self._grayscale else image
     return {'image': image}
 
-
 class Collect:
+    """
+    环境包装器，用于收集和处理完整的episode数据
+    
+    在每个episode结束时，将收集到的所有转换(transition)数据
+    整理成字典形式，并触发注册的回调函数
+    """
+    
+    def __init__(self, env, callbacks=None, precision=32):
+        """
+        初始化收集器
+        
+        参数:
+            env: 被包装的环境
+            callbacks: 回调函数列表，每个episode结束时调用
+            precision: 数据精度(16/32/64位)，用于转换浮点数和整数
+        """
+        self._env = env                      # 底层环境
+        self._callbacks = callbacks or ()   # 回调函数列表
+        self._precision = precision          # 数据精度
+        self._episode = None                 # 存储当前episode的转换数据
 
-  def __init__(self, env, callbacks=None, precision=32):
-    self._env = env
-    self._callbacks = callbacks or ()
-    self._precision = precision
-    self._episode = None
+    def __getattr__(self, name):
+        """
+        属性代理：将未定义的属性访问转发到底层环境
+        允许直接访问底层环境的方法和属性
+        """
+        return getattr(self._env, name)
 
-  def __getattr__(self, name):
-    return getattr(self._env, name)
+    def step(self, action):
+        """
+        执行环境步骤并收集转换数据
+        
+        参数:
+            action: 要执行的动作
+            
+        返回:
+            obs: 观测
+            reward: 奖励
+            done: 是否episode结束
+            info: 额外信息(包含完整episode数据)
+        """
+        # 执行底层环境的step方法
+        obs, reward, done, info = self._env.step(action)
+        
+        # 转换观测数据类型
+        obs = {k: self._convert(v) for k, v in obs.items()}
+        
+        # 创建转换数据字典(包含观测、动作、奖励等)
+        transition = obs.copy()
+        transition['action'] = action
+        transition['reward'] = reward
+        # 从info中获取折扣因子，默认1-done
+        transition['discount'] = info.get('discount', np.array(1 - float(done)))
+        
+        # 将当前转换添加到episode列表
+        self._episode.append(transition)
+        
+        # 当episode结束时
+        if done:
+            # 整理完整episode数据
+            episode = {k: [t[k] for t in self._episode] for k in self._episode[0]}
 
-  def step(self, action):
-    obs, reward, done, info = self._env.step(action)
-    obs = {k: self._convert(v) for k, v in obs.items()}
-    transition = obs.copy()
-    transition['action'] = action
-    transition['reward'] = reward
-    transition['discount'] = info.get('discount', np.array(1 - float(done)))
-    self._episode.append(transition)
-    if done:
-      episode = {k: [t[k] for t in self._episode] for k in self._episode[0]}
-      episode = {k: self._convert(v) for k, v in episode.items()}
-      info['episode'] = episode
-      for callback in self._callbacks:
-        callback(episode)
-    return obs, reward, done, info
+            # self._episode = [
+            #     {
+            #         'observation': array([0.1, 0.2]),
+            #         'action': 0,
+            #         'reward': 0.0,
+            #         'discount': 1.0
+            #     },
+            #     {
+            #         'observation': array([0.3, 0.4]),
+            #         'action': 1,
+            #         'reward': 0.1,
+            #         'discount': 1.0
+            #     },
+            #     # 更多时间步...
+            # ]
+            # 转变为：
+            # {
+            #     'observation': [array([0.1, 0.2]), array([0.3, 0.4])],
+            #     'action': [0, 1],
+            #     'reward': [0.0, 0.1],
+            #     'discount': [1.0, 1.0]
+            # }
 
-  def reset(self):
-    obs = self._env.reset()
-    transition = obs.copy()
-    transition['action'] = np.zeros(self._env.action_space.shape)
-    transition['reward'] = 0.0
-    transition['discount'] = 1.0
-    self._episode = [transition]
-    return obs
+            # 转换episode数据类型
+            episode = {k: self._convert(v) for k, v in episode.items()}
+            
+            # 将episode数据添加到info字典
+            info['episode'] = episode
+            
+            # 触发所有回调函数
+            for callback in self._callbacks:
+                callback(episode)
+                
+        return obs, reward, done, info
 
-  def _convert(self, value):
-    value = np.array(value)
-    if np.issubdtype(value.dtype, np.floating):
-      dtype = {16: np.float16, 32: np.float32, 64: np.float64}[self._precision]
-    elif np.issubdtype(value.dtype, np.signedinteger):
-      dtype = {16: np.int16, 32: np.int32, 64: np.int64}[self._precision]
-    elif np.issubdtype(value.dtype, np.uint8):
-      dtype = np.uint8
-    else:
-      raise NotImplementedError(value.dtype)
-    return value.astype(dtype)
+    def reset(self):
+        """
+        重置环境并初始化episode数据
+        
+        返回:
+            obs: 初始观测
+        """
+        # 重置底层环境
+        obs = self._env.reset()
+        
+        # 创建初始转换数据(默认动作、奖励和折扣)
+        transition = obs.copy()
+        transition['action'] = np.zeros(self._env.action_space.shape)
+        transition['reward'] = 0.0
+        transition['discount'] = 1.0
+        
+        # 初始化episode列表
+        self._episode = [transition]
+        
+        return obs
 
+    def _convert(self, value):
+        """
+        将数据转换为指定精度的NumPy数组
+        
+        参数:
+            value: 要转换的数据(可以是标量、列表或数组)
+            
+        返回:
+            np.ndarray: 转换为指定数据类型的NumPy数组
+        """
+        # 首先将输入值转换为NumPy数组
+        # 如果value已经是数组，则保持不变；否则转换为数组
+        value = np.array(value)
+        
+        # 根据数据类型和配置的精度选择目标数据类型
+        if np.issubdtype(value.dtype, np.floating):
+            # 浮点类型：根据_precision选择float16/32/64
+            dtype = {16: np.float16, 32: np.float32, 64: np.float64}[self._precision]
+            
+        elif np.issubdtype(value.dtype, np.signedinteger):
+            # 有符号整数类型：根据_precision选择int16/32/64
+            dtype = {16: np.int16, 32: np.int32, 64: np.int64}[self._precision]
+            
+        elif np.issubdtype(value.dtype, np.uint8):
+            # 无符号8位整数：通常用于图像数据，保持原类型不变
+            dtype = np.uint8
+            
+        else:
+            # 不支持的类型：抛出异常
+            raise NotImplementedError(f"Unsupported dtype: {value.dtype}")
+            
+        # 将数组转换为目标数据类型
+        # astype()返回新数组，不改变原数组
+        return value.astype(dtype)
 
 class TimeLimit:
 
@@ -221,7 +324,6 @@ class TimeLimit:
     self._step = 0
     return self._env.reset()
 
-
 class ActionRepeat:
 
   def __init__(self, env, amount):
@@ -240,7 +342,6 @@ class ActionRepeat:
       total_reward += reward
       current_step += 1
     return obs, total_reward, done, info
-
 
 class NormalizeActions:
 
@@ -265,7 +366,6 @@ class NormalizeActions:
     original = (action + 1) / 2 * (self._high - self._low) + self._low
     original = np.where(self._mask, original, action)
     return self._env.step(original)
-
 
 class ObsDict:
 
@@ -294,7 +394,6 @@ class ObsDict:
     obs = self._env.reset()
     obs = {self._key: np.array(obs)}
     return obs
-
 
 class OneHotAction:
 
@@ -330,7 +429,6 @@ class OneHotAction:
     reference[index] = 1.0
     return reference
 
-
 class RewardObs:
 
   def __init__(self, env):
@@ -355,7 +453,6 @@ class RewardObs:
     obs = self._env.reset()
     obs['reward'] = 0.0
     return obs
-
 
 class Async:
 
